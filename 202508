@@ -1,0 +1,682 @@
+import React, { useState, useRef, useEffect, useCallback } from 'react';
+
+// Common paper sizes in pixels at 300 DPI
+const PAPER_SIZES = {
+  A5: { width: 1748, height: 2480, label: 'A5 (148x210mm)' },
+  Postcard: { width: 1181, height: 1748, label: 'ポストカード (100x148mm)' },
+  Custom: { width: 0, height: 0, label: 'カスタム' }, // Placeholder for custom dimensions
+};
+
+// Main App component
+const App = () => {
+  const [selectedImage, setSelectedImage] = useState(null); // Stores the uploaded image file
+  const [imageSrc, setImageSrc] = useState(null); // Stores the data URL of the image
+  const [paperSize, setPaperSize] = useState('A5'); // Currently selected paper size key
+  const [customWidth, setCustomWidth] = useState(''); // Custom width input
+  const [customHeight, setCustomHeight] = useState(''); // Custom height input
+  const [resizeMethod, setResizeMethod] = useState('auto'); // 'auto' or 'manual'
+  const [cropArea, setCropArea] = useState({ x: 0, y: 0, width: 0, height: 0 }); // Current crop area (relative to image dimensions)
+  const [croppedImageSrc, setCroppedImageSrc] = useState(null); // Data URL of the preview cropped image (base image without emojis)
+  const [isDragging, setIsDragging] = useState(false); // Flag for manual cropping drag
+  const [dragStart, setDragStart] = useState({ x: 0, y: 0 }); // Starting point of drag (for crop area)
+  const [isResizing, setIsResizing] = useState(false); // Flag for manual cropping resize
+  const [resizeHandle, setResizeHandle] = useState(''); // Which handle is being resized (for crop area)
+  const [emojis, setEmojis] = useState([]); // Stores [{ emoji: '😊', x: 10, y: 20, size: 40, id: uniqueId }] for placed emojis
+  const [selectedEmoji, setSelectedEmoji] = useState('😊'); // Currently selected emoji for stamping
+  const [draggingEmojiId, setDraggingEmojiId] = useState(null); // ID of the emoji currently being dragged
+  const [dragEmojiOffset, setDragEmojiOffset] = useState({ x: 0, y: 0 }); // Offset for emoji dragging
+
+  const canvasRef = useRef(null); // Reference to the main canvas (for original image with crop overlay)
+  const previewCanvasRef = useRef(null); // New ref for the preview canvas (for cropped image with emojis)
+  const imageRef = useRef(new Image()); // Reference to the actual image object
+
+  // Function to handle image file selection
+  const handleImageChange = useCallback((event) => {
+    const file = event.target.files[0];
+    if (file && file.type.startsWith('image/')) {
+      setSelectedImage(file);
+      setEmojis([]); // Clear emojis when a new image is loaded
+    } else {
+      setSelectedImage(null);
+      alert('有効な画像ファイルを選択してください。'); // Use alert for simplicity, could be a custom modal
+    }
+  }, []);
+
+  // Function to get the target dimensions based on selected paper size or custom input
+  const getTargetDimensions = useCallback(() => {
+    if (paperSize === 'Custom') {
+      const width = parseInt(customWidth, 10);
+      const height = parseInt(customHeight, 10);
+      if (!isNaN(width) && width > 0 && !isNaN(height) && height > 0) {
+        return { width, height };
+      }
+      return { width: 1, height: 1 }; // Prevent division by zero, though a better UI would prevent invalid input
+    }
+    return PAPER_SIZES[paperSize];
+  }, [paperSize, customWidth, customHeight]);
+
+  // Function to draw the image and crop area on the main canvas (original image view)
+  const drawCanvas = useCallback(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || !imageRef.current.complete || !imageRef.current.naturalWidth) return;
+
+    const ctx = canvas.getContext('2d');
+    const img = imageRef.current;
+
+    // Set canvas dimensions to match image natural dimensions for accurate drawing
+    canvas.width = img.naturalWidth;
+    canvas.height = img.naturalHeight;
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+    // Draw crop rectangle if manual method is selected and cropArea is valid
+    if (resizeMethod === 'manual' && cropArea.width > 0 && cropArea.height > 0) {
+      ctx.strokeStyle = '#3B82F6'; // Tailwind blue-500
+      ctx.lineWidth = 4;
+      ctx.setLineDash([6, 3]); // Dashed line
+      ctx.strokeRect(cropArea.x, cropArea.y, cropArea.width, cropArea.height);
+      ctx.setLineDash([]); // Reset line dash
+
+      // Draw resize handles
+      const handleSize = 10;
+      ctx.fillStyle = '#3B82F6';
+      ctx.fillRect(cropArea.x - handleSize / 2, cropArea.y - handleSize / 2, handleSize, handleSize); // Top-left
+      ctx.fillRect(cropArea.x + cropArea.width - handleSize / 2, cropArea.y - handleSize / 2, handleSize, handleSize); // Top-right
+      ctx.fillRect(cropArea.x - handleSize / 2, cropArea.y + cropArea.height - handleSize / 2, handleSize, handleSize); // Bottom-left
+      ctx.fillRect(cropArea.x + cropArea.width - handleSize / 2, cropArea.y + cropArea.height - handleSize / 2, handleSize, handleSize); // Bottom-right
+    }
+  }, [cropArea, resizeMethod]);
+
+  // Function to generate the base cropped image data URL (without emojis)
+  const updateCroppedImageSrc = useCallback(() => {
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d');
+    const img = imageRef.current;
+
+    if (!img.complete || !img.naturalWidth || cropArea.width <= 0 || cropArea.height <= 0) {
+      setCroppedImageSrc(null);
+      return;
+    }
+
+    const target = getTargetDimensions();
+
+    canvas.width = target.width;
+    canvas.height = target.height;
+
+    ctx.drawImage(
+      img,
+      cropArea.x, cropArea.y, cropArea.width, cropArea.height, // Source rectangle from original image
+      0, 0, target.width, target.height // Destination rectangle on new canvas
+    );
+
+    setCroppedImageSrc(canvas.toDataURL('image/png'));
+  }, [cropArea, getTargetDimensions]);
+
+  // Function to draw the preview canvas with the cropped image and emojis
+  const drawPreviewCanvas = useCallback(() => {
+    const previewCanvas = previewCanvasRef.current;
+    if (!previewCanvas || !croppedImageSrc) {
+      // Clear canvas if no image
+      if (previewCanvas) {
+        const ctx = previewCanvas.getContext('2d');
+        ctx.clearRect(0, 0, previewCanvas.width, previewCanvas.height);
+      }
+      return;
+    }
+
+    const ctx = previewCanvas.getContext('2d');
+    const img = new Image();
+    img.src = croppedImageSrc; // Use the already cropped image data URL as the base
+
+    img.onload = () => {
+        const target = getTargetDimensions();
+        previewCanvas.width = target.width;
+        previewCanvas.height = target.height;
+
+        ctx.clearRect(0, 0, previewCanvas.width, previewCanvas.height);
+        ctx.drawImage(img, 0, 0, previewCanvas.width, previewCanvas.height);
+
+        // Draw emojis on top of the cropped image
+        emojis.forEach(e => {
+            ctx.font = `${e.size}px Arial`; // Use Arial or a suitable font for emojis
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(e.emoji, e.x, e.y);
+        });
+    };
+    // Handle cases where image might already be loaded (e.g., from cache)
+    if (img.complete) {
+        const target = getTargetDimensions();
+        previewCanvas.width = target.width;
+        previewCanvas.height = target.height;
+        ctx.clearRect(0, 0, previewCanvas.width, previewCanvas.height);
+        ctx.drawImage(img, 0, 0, previewCanvas.width, previewCanvas.height);
+        emojis.forEach(e => {
+            ctx.font = `${e.size}px Arial`;
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(e.emoji, e.x, e.y);
+        });
+    }
+  }, [croppedImageSrc, emojis, getTargetDimensions]);
+
+  // Effect to load image into Image object and set imageSrc
+  useEffect(() => {
+    if (selectedImage) {
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        setImageSrc(reader.result);
+        imageRef.current.src = reader.result;
+        // The subsequent useEffect will handle crop area calculation after image loads
+      };
+      reader.readAsDataURL(selectedImage);
+    } else {
+      setImageSrc(null);
+      setCroppedImageSrc(null);
+      setCropArea({ x: 0, y: 0, width: 0, height: 0 }); // Reset crop area when no image
+      setEmojis([]); // Also clear emojis
+    }
+  }, [selectedImage]);
+
+  // Effect to calculate auto crop area or initialize manual crop area
+  useEffect(() => {
+    const img = imageRef.current;
+    // Ensure image is loaded and has natural dimensions before proceeding
+    if (!imageSrc || !img.complete || !img.naturalWidth) return;
+
+    const { naturalWidth: imgW, naturalHeight: imgH } = img;
+    const target = getTargetDimensions();
+    const targetAspectRatio = target.width / target.height;
+
+    let newCropArea; // Declare a new variable to hold the calculated crop area
+
+    if (resizeMethod === 'auto') {
+      let cropWidth = imgW;
+      let cropHeight = imgH;
+      const imageAspectRatio = imgW / imgH;
+
+      if (imageAspectRatio > targetAspectRatio) {
+        cropWidth = imgH * targetAspectRatio;
+      } else {
+        cropHeight = imgW / targetAspectRatio;
+      }
+
+      const autoCropX = (imgW - cropWidth) / 2;
+      const autoCropY = (imgH - cropHeight) / 2;
+      newCropArea = { x: autoCropX, y: autoCropY, width: cropWidth, height: cropHeight };
+    } else { // manual
+      // Initialize manual crop area to full image if not already set to full image or if image changes
+      newCropArea = { x: 0, y: 0, width: imgW, height: imgH };
+    }
+
+    // Only update if the calculated crop area is significantly different
+    if (
+      Math.abs(cropArea.x - newCropArea.x) > 0.1 ||
+      Math.abs(cropArea.y - newCropArea.y) > 0.1 ||
+      Math.abs(cropArea.width - newCropArea.width) > 0.1 ||
+      Math.abs(cropArea.height - newCropArea.height) > 0.1
+    ) {
+      setCropArea(newCropArea);
+    }
+  }, [imageSrc, resizeMethod, paperSize, customWidth, customHeight, getTargetDimensions]);
+
+  // Effect to trigger drawing the main canvas (original image with crop overlay)
+  useEffect(() => {
+    drawCanvas();
+  }, [drawCanvas]); // Dependency on drawCanvas (which depends on cropArea and resizeMethod)
+
+  // Effect to trigger updating the cropped image source (base image without emojis)
+  useEffect(() => {
+    updateCroppedImageSrc();
+  }, [cropArea, imageSrc, updateCroppedImageSrc]); // Dependencies for generating croppedImageSrc
+
+  // Effect to trigger drawing the preview canvas (cropped image with emojis)
+  useEffect(() => {
+    drawPreviewCanvas();
+  }, [drawPreviewCanvas]); // Dependency on drawPreviewCanvas (which depends on croppedImageSrc and emojis)
+
+  // Mouse event handlers for manual cropping on the main canvas
+  const getMousePos = (e) => {
+    const canvas = canvasRef.current;
+    const rect = canvas.getBoundingClientRect();
+    // Calculate scale factor to translate mouse coordinates from CSS pixels to canvas pixels
+    const scaleX = canvas.width / rect.width;
+    const scaleY = canvas.height / rect.height;
+    return {
+      x: (e.clientX - rect.left) * scaleX,
+      y: (e.clientY - rect.top) * scaleY,
+    };
+  };
+
+  const getHandle = (mouseX, mouseY) => {
+    const { x, y, width, height } = cropArea;
+    const handleSize = 10; // Size of the interactive handle area
+    // Check if mouse is within the bounds of any resize handle
+    if (mouseX >= x - handleSize && mouseX <= x + handleSize &&
+        mouseY >= y - handleSize && mouseY <= y + handleSize) return 'tl'; // Top-left
+    if (mouseX >= x + width - handleSize && mouseX <= x + width + handleSize &&
+        mouseY >= y - handleSize && mouseY <= y + handleSize) return 'tr'; // Top-right
+    if (mouseX >= x - handleSize && mouseX <= x + handleSize &&
+        mouseY >= y + height - handleSize && mouseY <= y + height + handleSize) return 'bl'; // Bottom-left
+    if (mouseX >= x + width - handleSize && mouseX <= x + width + handleSize &&
+        mouseY >= y + height - handleSize && mouseY <= y + height + handleSize) return 'br'; // Bottom-right
+    return ''; // No handle clicked
+  };
+
+  const onMouseDown = (e) => {
+    if (resizeMethod !== 'manual' || !imageSrc) return; // Only active in manual mode with an image
+    const { x, y } = getMousePos(e);
+    const handle = getHandle(x, y);
+
+    if (handle) {
+      setIsResizing(true);
+      setResizeHandle(handle);
+    } else if (x >= cropArea.x && x <= cropArea.x + cropArea.width &&
+               y >= cropArea.y && y <= cropArea.y + cropArea.height) {
+      // Click inside the crop area, start dragging
+      setIsDragging(true);
+      setDragStart({ x: x - cropArea.x, y: y - cropArea.y }); // Offset for dragging
+    }
+  };
+
+  const onMouseMove = (e) => {
+    if (resizeMethod !== 'manual' || !imageSrc) return; // Only active in manual mode with an image
+    // If not dragging or resizing, just return
+    if (!isDragging && !isResizing) return;
+
+    const { x, y } = getMousePos(e);
+    const imgW = imageRef.current.naturalWidth;
+    const imgH = imageRef.current.naturalHeight;
+    const target = getTargetDimensions();
+    const targetAspectRatio = target.width / target.height;
+
+    if (isDragging) {
+      let newX = x - dragStart.x;
+      let newY = y - dragStart.y;
+
+      // Keep crop area within image bounds
+      newX = Math.max(0, Math.min(newX, imgW - cropArea.width));
+      newY = Math.max(0, Math.min(newY, imgH - cropArea.height));
+
+      setCropArea(prev => ({ ...prev, x: newX, y: newY }));
+    } else if (isResizing) {
+      let newCropX = cropArea.x;
+      let newCropY = cropArea.y;
+      let newCropW = cropArea.width;
+      let newCropH = cropArea.height;
+
+      switch (resizeHandle) {
+        case 'tl': // Top-left handle
+          newCropW = cropArea.width + (cropArea.x - x);
+          newCropX = x;
+          newCropH = newCropW / targetAspectRatio; // Maintain aspect ratio
+          newCropY = cropArea.y + cropArea.height - newCropH;
+          break;
+        case 'tr': // Top-right handle
+          newCropW = x - cropArea.x;
+          newCropH = newCropW / targetAspectRatio; // Maintain aspect ratio
+          newCropY = cropArea.y + cropArea.height - newCropH;
+          break;
+        case 'bl': // Bottom-left handle
+          newCropW = cropArea.width + (cropArea.x - x);
+          newCropX = x;
+          newCropH = newCropW / targetAspectRatio; // Maintain aspect ratio
+          newCropY = y; // Adjust Y based on mouse for bottom handles
+          break;
+        case 'br': // Bottom-right handle
+          newCropW = x - cropArea.x;
+          newCropH = newCropW / targetAspectRatio; // Maintain aspect ratio
+          newCropY = y - newCropH; // Adjust Y based on mouse for bottom handles
+          break;
+        default:
+          break;
+      }
+
+      // Ensure minimum size and stay within image bounds
+      newCropW = Math.max(10, newCropW); // Minimum width to prevent collapse
+      newCropH = Math.max(10, newCropH); // Minimum height to prevent collapse
+
+      // Adjust crop area to stay within image boundaries after resizing
+      if (newCropX < 0) { newCropX = 0; newCropW = cropArea.width; } // Prevent going left of image
+      if (newCropY < 0) { newCropY = 0; newCropH = cropArea.height; } // Prevent going above image
+      if (newCropX + newCropW > imgW) { newCropW = imgW - newCropX; newCropH = newCropW / targetAspectRatio; } // Prevent going right of image
+      if (newCropY + newCropH > imgH) { newCropH = imgH - newCropY; newCropW = newCropH * targetAspectRatio; } // Prevent going below image
+
+      setCropArea({ x: newCropX, y: newCropY, width: newCropW, height: newCropH });
+    }
+  };
+
+  const onMouseUp = () => {
+    setIsDragging(false);
+    setIsResizing(false);
+    setResizeHandle('');
+  };
+
+  // Mouse event handlers for preview canvas (emoji dragging)
+  const getPreviewMousePos = (e) => {
+    const canvas = previewCanvasRef.current;
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = canvas.width / rect.width;
+    const scaleY = canvas.height / rect.height;
+    return {
+      x: (e.clientX - rect.left) * scaleX,
+      y: (e.clientY - rect.top) * scaleY,
+    };
+  };
+
+  const handlePreviewMouseDown = useCallback((e) => {
+    if (!croppedImageSrc) return; // Can't drag if no cropped image
+
+    const { x: mouseX, y: mouseY } = getPreviewMousePos(e);
+
+    // Find if any emoji is clicked
+    const clickedEmoji = emojis.find(emoji => {
+      // Emojis are drawn with center at (x,y), so check bounding box around center
+      const halfSize = emoji.size / 2;
+      return (
+        mouseX >= emoji.x - halfSize &&
+        mouseX <= emoji.x + halfSize &&
+        mouseY >= emoji.y - halfSize &&
+        mouseY <= emoji.y + halfSize
+      );
+    });
+
+    if (clickedEmoji) {
+      setDraggingEmojiId(clickedEmoji.id);
+      setDragEmojiOffset({
+        x: mouseX - clickedEmoji.x,
+        y: mouseY - clickedEmoji.y,
+      });
+    }
+  }, [emojis, croppedImageSrc]);
+
+  const handlePreviewMouseMove = useCallback((e) => {
+    if (draggingEmojiId === null) return; // Not dragging an emoji
+
+    const { x: mouseX, y: mouseY } = getPreviewMousePos(e);
+
+    setEmojis(prevEmojis =>
+      prevEmojis.map(emoji => {
+        if (emoji.id === draggingEmojiId) {
+          let newX = mouseX - dragEmojiOffset.x;
+          let newY = mouseY - dragEmojiOffset.y;
+
+          // Keep emoji within canvas bounds
+          const canvas = previewCanvasRef.current;
+          const halfSize = emoji.size / 2;
+          newX = Math.max(halfSize, Math.min(newX, canvas.width - halfSize));
+          newY = Math.max(halfSize, Math.min(newY, canvas.height - halfSize));
+
+          return { ...emoji, x: newX, y: newY };
+        }
+        return emoji;
+      })
+    );
+  }, [draggingEmojiId, dragEmojiOffset]);
+
+  const handlePreviewMouseUp = useCallback(() => {
+    setDraggingEmojiId(null);
+    setDragEmojiOffset({ x: 0, y: 0 });
+  }, []);
+
+  // Function to add emoji to the center of the preview canvas
+  const addEmojiToCanvas = useCallback(() => {
+    if (!selectedEmoji || !previewCanvasRef.current || !croppedImageSrc) return; // Ensure cropped image exists
+
+    const canvas = previewCanvasRef.current;
+    const centerX = canvas.width / 2;
+    const centerY = canvas.height / 2;
+
+    setEmojis(prevEmojis => [
+      ...prevEmojis,
+      { id: Date.now(), emoji: selectedEmoji, x: centerX, y: centerY, size: 240 } // Use Date.now() for unique ID
+    ]);
+  }, [selectedEmoji, croppedImageSrc]);
+
+  // Function to download the final image including cropping and emojis
+  const downloadImage = () => {
+    if (!imageSrc || !croppedImageSrc) {
+      alert('リサイズされた画像がありません。');
+      return;
+    }
+
+    const finalCanvas = document.createElement('canvas');
+    const finalCtx = finalCanvas.getContext('2d');
+    const img = imageRef.current; // Use the original image object
+    const target = getTargetDimensions();
+
+    // Set final canvas dimensions to target paper size
+    finalCanvas.width = target.width;
+    finalCanvas.height = target.height;
+
+    // Draw the cropped portion of the original image first
+    finalCtx.drawImage(
+      img,
+      cropArea.x, cropArea.y, cropArea.width, cropArea.height, // Source rectangle from original image
+      0, 0, target.width, target.height // Destination rectangle on final canvas
+    );
+
+    // Draw emojis on top of the cropped image
+    emojis.forEach(e => {
+        finalCtx.font = `${e.size}px Arial`; // Ensure font is available for emojis
+        finalCtx.textAlign = 'center';
+        finalCtx.textBaseline = 'middle';
+        finalCtx.fillText(e.emoji, e.x, e.y);
+    });
+
+    const link = document.createElement('a');
+    link.href = finalCanvas.toDataURL('image/png');
+    link.download = `resized_and_decorated_image_${paperSize}.png`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
+  return (
+    <div className="min-h-screen bg-gray-100 p-4 flex flex-col items-center font-inter">
+      <div className="bg-white p-6 rounded-lg shadow-md w-full max-w-4xl">
+        <h1 className="text-3xl font-bold text-gray-800 mb-6 text-center">画像リサイズアプリ</h1>
+
+        {/* Image Upload */}
+        <div className="mb-6">
+          <label htmlFor="image-upload" className="block text-lg font-medium text-gray-700 mb-2">
+            画像をアップロード
+          </label>
+          <input
+            type="file"
+            id="image-upload"
+            accept="image/*"
+            onChange={handleImageChange}
+            className="block w-full text-sm text-gray-500
+                       file:mr-4 file:py-2 file:px-4
+                       file:rounded-full file:border-0
+                       file:text-sm file:font-semibold
+                       file:bg-blue-50 file:text-blue-700
+                       hover:file:bg-blue-100 cursor-pointer"
+          />
+        </div>
+
+        {selectedImage && (
+          <>
+            {/* Resize Options */}
+            <div className="mb-6 p-4 border border-gray-200 rounded-lg">
+              <h2 className="text-xl font-semibold text-gray-800 mb-4">リサイズ方法の選択</h2>
+
+              {/* Paper Size Selection */}
+              <div className="mb-4">
+                <label htmlFor="paper-size" className="block text-sm font-medium text-gray-700 mb-1">
+                  用紙サイズ
+                </label>
+                <select
+                  id="paper-size"
+                  value={paperSize}
+                  onChange={(e) => {
+                    setPaperSize(e.target.value);
+                    if (e.target.value !== 'Custom') {
+                      setCustomWidth('');
+                      setCustomHeight('');
+                    }
+                  }}
+                  className="mt-1 block w-full pl-3 pr-10 py-2 text-base border-gray-300 focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm rounded-md shadow-sm"
+                >
+                  {Object.entries(PAPER_SIZES).map(([key, value]) => (
+                    <option key={key} value={key}>
+                      {value.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              {/* Custom Dimensions Input */}
+              {paperSize === 'Custom' && (
+                <div className="mb-4 flex space-x-4">
+                  <div>
+                    <label htmlFor="custom-width" className="block text-sm font-medium text-gray-700 mb-1">
+                      カスタム幅 (px)
+                    </label>
+                    <input
+                      type="number"
+                      id="custom-width"
+                      value={customWidth}
+                      onChange={(e) => setCustomWidth(e.target.value)}
+                      placeholder="例: 1000"
+                      className="mt-1 block w-full pl-3 pr-3 py-2 text-base border-gray-300 focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm rounded-md shadow-sm"
+                    />
+                  </div>
+                  <div>
+                    <label htmlFor="custom-height" className="block text-sm font-medium text-gray-700 mb-1">
+                      カスタム高さ (px)
+                    </label>
+                    <input
+                      type="number"
+                      id="custom-height"
+                      value={customHeight}
+                      onChange={(e) => setCustomHeight(e.target.value)}
+                      placeholder="例: 1500"
+                      className="mt-1 block w-full pl-3 pr-3 py-2 text-base border-gray-300 focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm rounded-md shadow-sm"
+                    />
+                  </div>
+                </div>
+              )}
+
+              {/* Resize Method Selection */}
+              <div className="mb-4">
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  切り抜き方法
+                </label>
+                <div className="flex space-x-4">
+                  <label className="inline-flex items-center">
+                    <input
+                      type="radio"
+                      className="form-radio text-blue-600"
+                      name="resize-method"
+                      value="auto"
+                      checked={resizeMethod === 'auto'}
+                      onChange={() => setResizeMethod('auto')}
+                    />
+                    <span className="ml-2 text-gray-700">オート (中央を基準に自動切り抜き)</span>
+                  </label>
+                  <label className="inline-flex items-center">
+                    <input
+                      type="radio"
+                      className="form-radio text-blue-600"
+                      name="resize-method"
+                      value="manual"
+                      checked={resizeMethod === 'manual'}
+                      onChange={() => setResizeMethod('manual')}
+                    />
+                    <span className="ml-2 text-gray-700">マニュアル (ドラッグして範囲指定)</span>
+                  </label>
+                </div>
+              </div>
+            </div>
+
+            {/* Emoji Decoration Options */}
+            <div className="mb-6 p-4 border border-gray-200 rounded-lg">
+              <h2 className="text-xl font-semibold text-gray-800 mb-4">絵文字デコレーション</h2>
+              <div className="flex flex-wrap gap-2 mb-4">
+                {['😊', '😂', '👍', '❤️', '🌟', '🚀', '🎉', '🍕', '🐶', '🐱', '🌸', '🌈', '💡', '🎵', '💯', '✨', '👑', '🍦', '🍩', '🎁'].map(emoji => (
+                  <button
+                    key={emoji}
+                    onClick={() => setSelectedEmoji(emoji)}
+                    className={`p-2 rounded-full text-2xl transition-all duration-200 ${selectedEmoji === emoji ? 'bg-blue-200 scale-110' : 'bg-gray-100 hover:bg-gray-200'}`}
+                    title={`選択中の絵文字: ${emoji}`}
+                  >
+                    {emoji}
+                  </button>
+                ))}
+              </div>
+              <div className="flex gap-4 mt-4">
+                <button
+                  onClick={addEmojiToCanvas}
+                  className="px-4 py-2 bg-blue-500 text-white rounded-md hover:bg-blue-600 transition duration-200"
+                >
+                  絵文字を追加 (中央に配置)
+                </button>
+                <button
+                  onClick={() => setEmojis([])}
+                  className="px-4 py-2 bg-red-500 text-white rounded-md hover:bg-red-600 transition duration-200"
+                >
+                  絵文字をクリア
+                </button>
+              </div>
+            </div>
+
+            {/* Image Cropper and Preview */}
+            <div className="flex flex-col md:flex-row gap-6">
+              {/* Original Image with Crop Area */}
+              <div className="flex-1 bg-gray-50 p-4 rounded-lg shadow-inner flex justify-center items-center overflow-hidden">
+                {imageSrc && (
+                  <div className="relative max-w-full max-h-96 overflow-hidden flex justify-center items-center">
+                    <canvas
+                      ref={canvasRef}
+                      className="max-w-full h-auto rounded-md border border-gray-300"
+                      onMouseDown={onMouseDown}
+                      onMouseMove={onMouseMove}
+                      onMouseUp={onMouseUp}
+                      onMouseLeave={onMouseUp} // Stop dragging if mouse leaves canvas
+                    ></canvas>
+                    <p className="absolute bottom-2 left-2 text-xs text-gray-600 bg-white bg-opacity-75 px-2 py-1 rounded">
+                      オリジナル画像
+                    </p>
+                  </div>
+                )}
+              </div>
+
+              {/* Resized Image Preview (now a canvas for emoji drawing and dragging) */}
+              <div className="flex-1 bg-gray-50 p-4 rounded-lg shadow-inner flex flex-col justify-center items-center">
+                <h2 className="text-xl font-semibold text-gray-800 mb-4">プレビュー</h2>
+                {croppedImageSrc ? (
+                  <canvas
+                    ref={previewCanvasRef}
+                    className="max-w-full h-auto rounded-md border border-gray-300 shadow-md cursor-grab"
+                    onMouseDown={handlePreviewMouseDown}
+                    onMouseMove={handlePreviewMouseMove}
+                    onMouseUp={handlePreviewMouseUp}
+                    onMouseLeave={handlePreviewMouseUp} // Stop dragging if mouse leaves canvas
+                    style={{
+                        maxWidth: 'calc(100% - 20px)', // Adjust for padding
+                        maxHeight: '400px', // Limit height for preview
+                        objectFit: 'contain'
+                    }}
+                  ></canvas>
+                ) : (
+                  <p className="text-gray-500">プレビューがここに表示されます。</p>
+                )}
+                <button
+                  onClick={downloadImage}
+                  className="mt-6 px-6 py-3 bg-green-600 text-white font-semibold rounded-full shadow-lg hover:bg-green-700 transition duration-300 ease-in-out transform hover:scale-105"
+                >
+                  画像をダウンロード
+                </button>
+              </div>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+};
+
+export default App;
